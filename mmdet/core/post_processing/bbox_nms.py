@@ -95,7 +95,7 @@ def perclass_nms(multi_bboxes,
     if score_factors is not None:
         scores = scores * score_factors[:, None]
     scores = scores[valid_mask]
-    labels = valid_mask.nonzero()[:, 1]
+    labels = valid_mask.nonzero()# [:, 1]
 
     if bboxes.numel() == 0:
         bboxes = multi_bboxes.new_zeros((0, 5))
@@ -107,15 +107,15 @@ def perclass_nms(multi_bboxes,
 
     # do nms per class
     for cls in range(num_classes):
-        cls_inds = labels == cls
+        cls_inds = labels[:, 1] == cls
         cls_bboxes = bboxes[cls_inds]
         if cls_bboxes.size(0) == 0:
             continue
         cls_scores = scores[cls_inds]
-        cls_labels = labels[cls_inds]
+        cls_labels = labels[:, 1][cls_inds]
         dets, keep = batched_nms(cls_bboxes, cls_scores, cls_labels, nms_cfg)
         all_dets.append(dets)
-        all_labels.append(cls_labels[keep])
+        all_labels.append(labels[cls_inds][keep])
 
     # concate the results -> sort by score -> select top n
     all_dets = torch.cat(all_dets, dim=0)
