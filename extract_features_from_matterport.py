@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.multiprocessing as mp
-from torch.multiprocessing import Pool, Process, set_start_method
+from torch.multiprocessing import set_start_method
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import functional as F
 from mmdet.apis import init_detector
@@ -144,6 +144,13 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
     torch.cuda.set_device(device_id)
     model = init_detector(str(args.config), str(args.checkpoint), device=f'cuda:{device_id}')
 
+    print('Present', len(writer._keys))
+    done = set(tuple(bkey.decode().split("_")) for bkey in  writer._keys)
+    print('Done', len(done))
+    # import ipdb
+    # ipdb.set_trace()
+    viewpoint_list = [v for v in viewpoint_list if v not in done]
+
     dataset = MatterportDataset(viewpoint_list, args)
 
     disable = part_id == min(args.part_ids)
@@ -259,7 +266,7 @@ def load_viewpoints(args: Arguments) -> List[Tuple[str, str]]:
         key = key.decode().split('_')
         scan_viewpoints.append((key[0], key[1]))
 
-    return scan_viewpoints
+    return sorted(scan_viewpoints)
 
 
 class MatterportDataset(Dataset):
@@ -319,11 +326,11 @@ if __name__ == "__main__":
     viewpoints = load_viewpoints(args)
     viewpoints_lists = [viewpoints[i::args.num_parts] for i in range(args.num_parts)]
 
-    if len(args.part_ids) == 1:
+    if args.part_ids == []:
         raise ValueError()
     elif len(args.part_ids) == 1:
-        extract_feat(args.part_ids[0], viewpoints_lists, args)
+        extract_feat(0, viewpoints_lists, args)
     else:
         parts = (viewpoints_lists, args)
-        print('Spawn ', len(parts), 'procs')
+        print('Spawn ', len(args.part_ids), 'procs')
         mp.spawn(extract_feat, nprocs=len(args.part_ids), args=parts)
