@@ -135,7 +135,10 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
     num_viewpoints = len(viewpoint_list)
     print("Number of viewpoints on split{}: {}.".format(part_id, num_viewpoints))
 
-    lmdb_path = args.output.parent / f"{args.output.name}-{part_id}{args.output.suffix}"
+    if args.num_parts == 1:
+        lmdb_path = args.output
+    else:
+        lmdb_path = args.output.parent / f"{args.output.name}-{part_id}{args.output.suffix}"
     writer = LMDBWriter(str(lmdb_path), map_size=int(1e12), buffer_size=300)
 
     num_gpus = torch.cuda.device_count()
