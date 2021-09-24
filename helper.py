@@ -65,6 +65,14 @@ def inference_detector(model, img):
             rescale=True,
             cfg=model.roi_head.test_cfg)
 
+    if det_labels.numel() == 0:
+        return {
+            'bbox': det_bboxes.cpu(),
+            'labels': det_labels.cpu(),
+            'cls_score': bbox_results['cls_score'][:0, :-1].cpu(),
+            'features': bbox_results['bbox_feats'][:0, :-1].cpu(),
+        }
+
     inds = det_labels[:, 0]
 
     return {

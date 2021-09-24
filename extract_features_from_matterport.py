@@ -75,10 +75,8 @@ def get_ft_head_elev(bbox: torch.Tensor, view_id: torch.Tensor, width: int, heig
     ft_heading[more_than_pi] = (ft_heading - math.pi * 2)[more_than_pi]
     assert (-math.pi <= ft_heading).all() and (ft_heading <= math.pi).all()
 
-    elevation = torch.deg2rad((view_id // 12) * 30)
-    ft_elevation = elevation + torch.atan2(
-        -center_y + height / 2, focal_length
-    )
+    elevation = torch.deg2rad((view_id // 12) * 30 - 30)
+    ft_elevation = elevation + torch.atan2(-center_y + height / 2, focal_length)
 
     return ft_heading, ft_elevation
 
@@ -147,16 +145,14 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
     torch.cuda.set_device(device_id)
     model = init_detector(str(args.config), str(args.checkpoint), device=f'cuda:{device_id}')
 
-    print('Present', len(writer._keys))
     done = set(tuple(bkey.decode().split("_")) for bkey in  writer._keys)
     print('Done', len(done))
-    # import ipdb
-    # ipdb.set_trace()
     viewpoint_list = [v for v in viewpoint_list if v not in done]
+    print('Todo', len(viewpoint_list))
 
     dataset = MatterportDataset(viewpoint_list, args)
 
-    disable = part_id == min(args.part_ids)
+    disable = part_id != min(args.part_ids)
     for feats, scan, viewpoint in tqdm(dataset, disable=disable):
         all_boxes = []
         all_features = []
@@ -167,6 +163,7 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
         for view_id, im in zip(feats['view_ids'], feats['image_feat']):
 
             results = inference_detector(model, np.array(im))
+            assert len(results['bbox']) == len(results['features'])
 
             all_boxes.append(results['bbox'])
             all_probs.append(results['cls_score'])
@@ -191,6 +188,7 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
             feats['image_h'],
             feats['fov'],
         )
+        assert keep_ind.numel() > 0
 
         image_feat = image_feat[keep_ind]
         bbox = bbox[keep_ind]
