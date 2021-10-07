@@ -42,7 +42,7 @@ class Arguments(argtyped.Arguments):
     conf_thresh: float = 0.4
     min_local_boxes: int = 5
     max_local_boxes: int = 20
-    max_total_boxes: int = 100
+    max_total_boxes: int = 360
 
     views_per_sweep: int = 12
     # number of total views from one pano
@@ -56,61 +56,48 @@ class Arguments(argtyped.Arguments):
     elevation_inc: int = 30 
 
 
+def cartesian_to_polar(x: torch.Tensor, y: torch.Tensor, view_id: torch.Tensor, width: int, height: int, fov: float, normalize: bool = False):
+    """
+    Calculate the heading and elevation of the corners of each bbox.
+    WARNING: bbox are repeating with a 180 degree frequency!
+    """
+    focal_length = torch.tensor((height / 2) / math.tan(math.radians(fov / 2))).to(x.device)
 
+    heading = torch.deg2rad((view_id.long() % 12).float() * 30)
+    head = heading + torch.atan2(x - width / 2, focal_length)
+    if normalize:
+        head /= 2 * math.pi
 
+    elevation = torch.deg2rad((view_id.long() // 12).float() * 30 - 30)
+    elev = elevation + torch.atan2(-y + height / 2, focal_length)
+    if normalize:
+        elev = (elev + math.pi) / (math.pi * 2)
 
-def get_ft_head_elev(bbox: torch.Tensor, view_id: torch.Tensor, width: int, height: int, fov: float):
-    # Calculate the heading and elevation of the center of each observation
-    center_x = 0.5 * (bbox[:, 0] + bbox[:, 2])
-    center_y = 0.5 * (bbox[:, 1] + bbox[:, 3])
-    focal_length = torch.tensor((height / 2) / math.tan(math.radians(fov / 2))).to(bbox.device)
-
-    heading = torch.deg2rad((view_id % 12) * 30)
-    ft_heading = heading + torch.atan2(center_x - width / 2, focal_length)
-    # normalize featureHeading
-    ft_heading = ft_heading % (math.pi * 2)
-    assert (0 <= ft_heading).all() and (ft_heading <= math.pi * 2).all()
-    # force it to be the positive remainder, so that 0 <= angle < 360
-    more_than_pi = ft_heading > math.pi
-    ft_heading[more_than_pi] = (ft_heading - math.pi * 2)[more_than_pi]
-    assert (-math.pi <= ft_heading).all() and (ft_heading <= math.pi).all()
-
-    elevation = torch.deg2rad((view_id // 12) * 30 - 30)
-    ft_elevation = elevation + torch.atan2(-center_y + height / 2, focal_length)
-
-    return ft_heading, ft_elevation
-
+    return head, elev
 
 
 def filter_panorama(boxes: torch.Tensor, probs: torch.Tensor, features: torch.Tensor, view_ids: torch.Tensor, max_boxes: int, width: int, height: int, fov: float) -> torch.Tensor:
-    ft_heading, ft_elevation = get_ft_head_elev(boxes, view_ids, width, height, fov)
+    center_x = (boxes[:, 0] + boxes[:, 2]) / 2
+    center_y = (boxes[:, 1] + boxes[:, 3]) / 2
+    ft_heading, ft_elevation = cartesian_to_polar(center_x, center_y, view_ids, width, height, fov)
+    # import ipdb
+    # ipdb.set_trace()
     # Remove the most redundant features (that have similar heading, elevation and 
     # are close together to an existing feature in cosine distance)
-    pooled_features = features.sum(2).sum(2).unsqueeze(2)
-    feat_dist = F.cosine_similarity(pooled_features, pooled_features.transpose(0, 2), dim=1)
-
-    indices = torch.triu_indices(*feat_dist.shape, 1)
-
-    heading_diff_tri = F.pdist(ft_heading.unsqueeze(1), 2)
-    heading_diff_tri = torch.minimum(heading_diff_tri, 2*math.pi - heading_diff_tri)
-    heading_diff = torch.zeros_like(feat_dist)
-    heading_diff[indices[0], indices[1]] = heading_diff_tri
-
-    elevation_diff_tri = F.pdist(ft_elevation.unsqueeze(1), 2)
-    elevation_diff = torch.zeros_like(feat_dist)
-    elevation_diff[indices[0], indices[1]] = elevation_diff_tri
-
-    total_dist = feat_dist + heading_diff + elevation_diff # Could add weights
-
-    # Discard diagonal and upper triangle by setting large distance
-    dist = total_dist[indices[0], indices[1]]
-    arg_ind = torch.argsort(dist)
-
+    num_bbox = boxes.shape[0]
+    indices = torch.triu_indices(num_bbox, num_bbox, 1)
+    total_dist = (
+        # F.pdist(probs.softmax(1), p=2) + 
+        F.pdist(ft_heading.unsqueeze(1), 2) + 
+        F.pdist(ft_elevation.unsqueeze(1), 2)
+    )
+    arg_dist =torch.argsort(total_dist)
+    
     # Remove indices of the most similar features (in appearance and orientation)
-    keep = set(range(feat_dist.shape[0]))
+    keep = set(range(num_bbox))
     ix = 0
     while len(keep) > max_boxes:
-        min_ind = arg_ind[ix]
+        min_ind = arg_dist[ix]
         i, j = indices[:, min_ind].tolist()
 
         if i not in keep or j not in keep:
