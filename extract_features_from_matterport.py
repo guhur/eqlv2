@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple, Union, Set, DefaultDict, Optional
+from typing import List, Tuple, Union, Set, DefaultDict, Optional, Dict
 from typing_extensions import Literal, TypedDict
 import pickle
 from pathlib import Path
@@ -36,8 +36,11 @@ class Arguments(argtyped.Arguments):
     config: Path = Path("configs/end2end/eqlv2_r50_8x2_1x.py")
     part_ids: List[int] = [0]
     num_parts: int = 1
+    num_workers: int = 0
+    batch_size: int = 1
     output: Path = Path("matterport_eqlv2.lmdb")
     matterport: Path = Path("matterport.lmdb")
+    map_size: int = int(1e12)
 
     reverie_bbox: bool = False
     bbox_dir: Path = Path('data/bbox')
@@ -117,7 +120,10 @@ def filter_panorama(boxes: torch.Tensor, probs: torch.Tensor, features: torch.Te
     return torch.Tensor(list(keep)).long().to(boxes.device)
 
 
-def extract_feat(worker_id, viewpoint_lists, args: Arguments):
+def identity(x):
+    return x
+
+def extract_feat(worker_id: int, viewpoint_lists: List[Tuple], args: Arguments):
     part_id = args.part_ids[worker_id]
 
     viewpoint_list = viewpoint_lists[part_id]
@@ -128,7 +134,7 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
         lmdb_path = args.output
     else:
         lmdb_path = args.output.parent / f"{args.output.name}-{part_id}{args.output.suffix}"
-    writer = LMDBWriter(str(lmdb_path), map_size=int(1e12), buffer_size=300)
+    writer = LMDBWriter(str(lmdb_path), map_size=args.map_size, buffer_size=300)
 
     num_gpus = torch.cuda.device_count()
     assert num_gpus != 0
@@ -142,69 +148,80 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
     print('Todo', len(viewpoint_list))
 
     dataset = MatterportDataset(viewpoint_list, args)
+    dataloader = DataLoader(dataset, num_workers=args.num_workers, batch_size=args.batch_size, collate_fn=identity)
 
     disable = part_id != min(args.part_ids)
-    for feats, scan, viewpoint, bbox in tqdm(dataset, disable=disable):
-        all_boxes = []
-        all_features = []
-        all_probs = []
-        all_view_ids = []
-        all_labels = []
+    for batch in tqdm(dataloader, disable=disable):
+        for feats, scan, viewpoint, bbox_by_view_id in batch:
+            all_boxes = []
+            all_features = []
+            all_probs = []
+            all_view_ids = []
+            all_labels = []
 
-        for view_id, im in zip(feats['view_ids'], feats['image_feat']):
+            for view_id, im in zip(feats['view_ids'], feats['image_feat']):
+                if bbox_by_view_id is not None:
+                    if view_id not in bbox_by_view_id or bbox_by_view_id[view_id] == []:
+                        continue
+                    boxes = [b['bbox'] for b in bbox_by_view_id[view_id]]
+                    b = torch.Tensor(boxes).to(f'cuda:{device_id}')
+                    b[:, 2] += b[:, 0]
+                    b[:, 3] += b[:, 1]
+                    results = inference_detector(model, np.array(im), [b])
+                else:
+                    results = inference_detector(model, np.array(im))
+                assert len(results['bbox']) == len(results['features'])
 
-            results = inference_detector(model, np.array(im), bbox)
-            assert len(results['bbox']) == len(results['features'])
+                all_boxes.append(results['bbox'])
+                all_probs.append(results['cls_score'])
+                all_features.append(results['features'])
+                all_labels.append(results['labels'])
+                num_bbox = results['bbox'].shape[0]
+                all_view_ids += [view_id] * num_bbox
 
-            all_boxes.append(results['bbox'])
-            all_probs.append(results['cls_score'])
-            all_features.append(results['features'])
-            all_labels.append(results['labels'])
-            num_bbox = results['bbox'].shape[0]
-            all_view_ids += [view_id] * num_bbox
+            if all_features == []:
+                continue
 
-        image_feat = torch.cat(all_features)
-        bbox = torch.cat(all_boxes)
-        probs = torch.cat(all_probs)
-        view_ids = torch.Tensor(all_view_ids)
-        labels = torch.cat(all_labels)
+            image_feat = torch.cat(all_features)
+            bbox = torch.cat(all_boxes)
+            probs = torch.cat(all_probs)
+            view_ids = torch.Tensor(all_view_ids)
+            labels = torch.cat(all_labels)
 
-        if bbox is not None:
-            keep_ind = filter_panorama(
-                bbox,
-                probs,
-                image_feat,
-                view_ids,
-                args.max_total_boxes, 
-                feats['image_w'],
-                feats['image_h'],
-                feats['fov'],
-            )
-            assert keep_ind.numel() > 0
+            if bbox is not None:
+                keep_ind = filter_panorama(
+                    bbox,
+                    probs,
+                    image_feat,
+                    view_ids,
+                    args.max_total_boxes, 
+                    feats['image_w'],
+                    feats['image_h'],
+                    feats['fov'],
+                )
+                assert keep_ind.numel() > 0
 
-            image_feat = image_feat[keep_ind]
-            bbox = bbox[keep_ind]
-            probs = probs[keep_ind]
-            view_ids = view_ids[keep_ind]
-            labels = labels[keep_ind]
+                image_feat = image_feat[keep_ind]
+                bbox = bbox[keep_ind]
+                probs = probs[keep_ind]
+                view_ids = view_ids[keep_ind]
+                labels = labels[keep_ind]
 
-        data = {
-            "image_feat": image_feat,
-            "boxes": bbox,
-            "image_h": feats['image_h'],
-            "image_w": feats['image_w'],
-            "fov": feats['fov'],
-            "view_ids": view_ids,
-            "labels": labels,
-            "cls_probs": probs,
+            data = {
+                "image_feat": image_feat,
+                "boxes": bbox,
+                "image_h": feats['image_h'],
+                "image_w": feats['image_w'],
+                "fov": feats['fov'],
+                "view_ids": view_ids,
+                "labels": labels,
+                "cls_probs": probs,
 
-        }
+            }
 
-        key = f"{scan}_{viewpoint}"
-        writer.put(key.encode('ascii'), pickle.dumps(data))
-        writer.flush()
-
-
+            key = f"{scan}_{viewpoint}"
+            writer.put(key.encode('ascii'), pickle.dumps(data))
+            writer.flush()
 
 
 def load_json(path):
@@ -215,16 +232,25 @@ def load_json(path):
 
 class LMDBWriter:
     def __init__(self, path: Union[Path, str], map_size: int, buffer_size: int):
-        self._env = lmdb.open(str(path), map_size=map_size, max_readers=512)
         self._buffer: List[Tuple[bytes, bytes]] = []
         self._buffer_size = buffer_size
 
-        with self._env.begin(write=False) as txn:
+        self._path = str(path)
+        self._map_size = map_size
+        env = lmdb.open(self._path, map_size=map_size, max_readers=512)
+        with env.begin(write=False) as txn:
             bkeys = txn.get("__keys__".encode("ascii"))
             if bkeys is None:
                 self._keys: Set[bytes] = set()
             else:
                 self._keys = set(pickle.loads(bkeys))
+        self._env = None
+
+    @property
+    def env(self):
+        if self._env is None:
+            self._env = lmdb.open(self._path, map_size=self._map_size, max_readers=512)
+        return self._env
 
     def put(self, bkey: bytes, value: bytes):
         self._buffer.append((bkey, value))
@@ -236,7 +262,7 @@ class LMDBWriter:
         return [k.decode("ascii") for k in self._keys]
 
     def flush(self):
-        with self._env.begin(write=True) as txn:
+        with self.env.begin(write=True) as txn:
             for bkey, value in self._buffer:
                 txn.put(bkey, value)
             txn.put("__keys__".encode("ascii"), pickle.dumps(self._keys))
@@ -262,21 +288,28 @@ def load_viewpoints(args: Arguments) -> List[Tuple[str, str]]:
     return sorted(scan_viewpoints)
 
 
+
 class MatterportDataset(Dataset):
     def __init__(self, viewpoints: List[Tuple[str, str]], args: Arguments):
         self.viewpoints = viewpoints
         self.args = args
         self.counter = 0
-        self.env = lmdb.open(str(args.matterport))
-        self.txn = self.env.begin(write=False)
+        self._env = None
+        self._txn = None
 
         if args.reverie_bbox:
-            self.bbox = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+            self.bbox = {}
             for json_file in args.bbox_dir.glob('*.json'):
                 scan, viewpoint = json_file.stem.split('_')
                 data = load_json(json_file)[viewpoint]
+                if scan not in self.bbox:
+                    self.bbox[scan] = {}
+                if viewpoint not in self.bbox[scan]:
+                    self.bbox[scan][viewpoint] = {}
                 for obj_id, details in data.items():
                     for view_id, box in zip(details['visible_pos'], details['bbox2d']):
+                        if view_id not in self.bbox[scan][viewpoint]:
+                            self.bbox[scan][viewpoint][view_id] = []
                         self.bbox[scan][viewpoint][view_id].append({
                             'obj_id': obj_id,
                             'name': details['name'],
@@ -284,6 +317,23 @@ class MatterportDataset(Dataset):
                         })
         else:
             self.bbox = None
+
+    @property
+    def env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                str(self.args.matterport),
+                map_size=self.args.map_size,
+                readonly=True,
+                max_readers=512,
+            )
+        return self._env
+
+    @property
+    def txn(self):
+        if self._txn is None:
+            self._txn = self.env.begin(write=False)
+        return self._txn
 
     def __len__(self):
         return len(self.viewpoints)
@@ -298,7 +348,7 @@ class MatterportDataset(Dataset):
             raise StopIteration()
         return self[self.counter]
 
-    def __getitem__(self, index: int) -> Tuple[MatterportFeature, str, str, Optional[DefaultDict]]:
+    def __getitem__(self, index: int) -> Tuple[MatterportFeature, str, str, Optional[Dict]]:
         scan, viewpoint = self.viewpoints[index]
 
         key = f"{scan}_{viewpoint}"

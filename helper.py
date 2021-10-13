@@ -73,15 +73,15 @@ def inference_detector(model, img, bbox=None):
             cfg=cfg)
 
     if bbox is not None:
-        labels = det_labels.argmax(1).cpu()
-        cls_score = bbox_results['cls_score'][:0, :-1].cpu()
-        assert (labels == cls_score).all()
+        cls_score = bbox_results['cls_score'][:, :-1].cpu()
+        labels = cls_score.argmax(1)
         return {
-            'bbox': bboxes.cpu(),
+            'bbox': bbox[0].cpu(),
             'labels': labels,
             'cls_score': cls_score,
-            'features': bbox_results['bbox_feats'][:0, :-1].cpu(),
+            'features': bbox_results['bbox_feats'][:, :-1].cpu(),
         }
+
     if det_labels.numel() == 0:
         return {
             'bbox': det_bboxes.cpu(),
