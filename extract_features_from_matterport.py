@@ -158,12 +158,14 @@ def extract_feat(worker_id: int, viewpoint_lists: List[Tuple], args: Arguments):
             all_probs = []
             all_view_ids = []
             all_labels = []
+            all_reverie_ids = []
 
             for view_id, im in zip(feats['view_ids'], feats['image_feat']):
                 if bbox_by_view_id is not None:
                     if view_id not in bbox_by_view_id or bbox_by_view_id[view_id] == []:
                         continue
                     boxes = [b['bbox'] for b in bbox_by_view_id[view_id]]
+                    all_reverie_ids += [b['obj_id'] for b in bbox_by_view_id[view_id]]
                     b = torch.Tensor(boxes).to(f'cuda:{device_id}')
                     b[:, 2] += b[:, 0]
                     b[:, 3] += b[:, 1]
@@ -187,6 +189,7 @@ def extract_feat(worker_id: int, viewpoint_lists: List[Tuple], args: Arguments):
             probs = torch.cat(all_probs)
             view_ids = torch.Tensor(all_view_ids)
             labels = torch.cat(all_labels)
+            reverie_ids = torch.Tensor(all_reverie_ids)
 
             if bbox is not None:
                 keep_ind = filter_panorama(
@@ -206,6 +209,7 @@ def extract_feat(worker_id: int, viewpoint_lists: List[Tuple], args: Arguments):
                 probs = probs[keep_ind]
                 view_ids = view_ids[keep_ind]
                 labels = labels[keep_ind]
+                reverie_ids = reverie_ids[keep_ind]
 
             data = {
                 "image_feat": image_feat,
@@ -218,6 +222,9 @@ def extract_feat(worker_id: int, viewpoint_lists: List[Tuple], args: Arguments):
                 "cls_probs": probs,
 
             }
+
+            if all_reverie_ids != []:
+                data['reverie_ids'] = reverie_ids
 
             key = f"{scan}_{viewpoint}"
             writer.put(key.encode('ascii'), pickle.dumps(data))
@@ -311,7 +318,7 @@ class MatterportDataset(Dataset):
                         if view_id not in self.bbox[scan][viewpoint]:
                             self.bbox[scan][viewpoint][view_id] = []
                         self.bbox[scan][viewpoint][view_id].append({
-                            'obj_id': obj_id,
+                            'obj_id': int(obj_id),
                             'name': details['name'],
                             'bbox': box,
                         })
