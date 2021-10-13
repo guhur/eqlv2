@@ -1,8 +1,9 @@
 import math
-from typing import List, Tuple, Union, Set
+from typing import List, Tuple, Union, Set, DefaultDict, Optional
 from typing_extensions import Literal, TypedDict
 import pickle
 from pathlib import Path
+from collections import defaultdict
 import json
 import argtyped
 import lmdb
@@ -37,6 +38,9 @@ class Arguments(argtyped.Arguments):
     num_parts: int = 1
     output: Path = Path("matterport_eqlv2.lmdb")
     matterport: Path = Path("matterport.lmdb")
+
+    reverie_bbox: bool = False
+    bbox_dir: Path = Path('data/bbox')
 
     nms_thresh: float = 0.3
     conf_thresh: float = 0.4
@@ -140,7 +144,7 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
     dataset = MatterportDataset(viewpoint_list, args)
 
     disable = part_id != min(args.part_ids)
-    for feats, scan, viewpoint in tqdm(dataset, disable=disable):
+    for feats, scan, viewpoint, bbox in tqdm(dataset, disable=disable):
         all_boxes = []
         all_features = []
         all_probs = []
@@ -149,7 +153,7 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
 
         for view_id, im in zip(feats['view_ids'], feats['image_feat']):
 
-            results = inference_detector(model, np.array(im))
+            results = inference_detector(model, np.array(im), bbox)
             assert len(results['bbox']) == len(results['features'])
 
             all_boxes.append(results['bbox'])
@@ -165,23 +169,24 @@ def extract_feat(worker_id, viewpoint_lists, args: Arguments):
         view_ids = torch.Tensor(all_view_ids)
         labels = torch.cat(all_labels)
 
-        keep_ind = filter_panorama(
-            bbox,
-            probs,
-            image_feat,
-            view_ids,
-            args.max_total_boxes, 
-            feats['image_w'],
-            feats['image_h'],
-            feats['fov'],
-        )
-        assert keep_ind.numel() > 0
+        if bbox is not None:
+            keep_ind = filter_panorama(
+                bbox,
+                probs,
+                image_feat,
+                view_ids,
+                args.max_total_boxes, 
+                feats['image_w'],
+                feats['image_h'],
+                feats['fov'],
+            )
+            assert keep_ind.numel() > 0
 
-        image_feat = image_feat[keep_ind]
-        bbox = bbox[keep_ind]
-        probs = probs[keep_ind]
-        view_ids = view_ids[keep_ind]
-        labels = labels[keep_ind]
+            image_feat = image_feat[keep_ind]
+            bbox = bbox[keep_ind]
+            probs = probs[keep_ind]
+            view_ids = view_ids[keep_ind]
+            labels = labels[keep_ind]
 
         data = {
             "image_feat": image_feat,
@@ -265,6 +270,21 @@ class MatterportDataset(Dataset):
         self.env = lmdb.open(str(args.matterport))
         self.txn = self.env.begin(write=False)
 
+        if args.reverie_bbox:
+            self.bbox = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+            for json_file in args.bbox_dir.glob('*.json'):
+                scan, viewpoint = json_file.stem.split('_')
+                data = load_json(json_file)[viewpoint]
+                for obj_id, details in data.items():
+                    for view_id, box in zip(details['visible_pos'], details['bbox2d']):
+                        self.bbox[scan][viewpoint][view_id].append({
+                            'obj_id': obj_id,
+                            'name': details['name'],
+                            'bbox': box,
+                        })
+        else:
+            self.bbox = None
+
     def __len__(self):
         return len(self.viewpoints)
 
@@ -278,7 +298,7 @@ class MatterportDataset(Dataset):
             raise StopIteration()
         return self[self.counter]
 
-    def __getitem__(self, index: int) -> Tuple[MatterportFeature, str, str]:
+    def __getitem__(self, index: int) -> Tuple[MatterportFeature, str, str, Optional[DefaultDict]]:
         scan, viewpoint = self.viewpoints[index]
 
         key = f"{scan}_{viewpoint}"
@@ -287,7 +307,12 @@ class MatterportDataset(Dataset):
             raise RuntimeError()
         feats = pickle.loads(feats)
 
-        return feats,  scan, viewpoint
+        if self.bbox is None:
+            bbox = None
+        else:
+            bbox = self.bbox[scan][viewpoint]
+
+        return feats,  scan, viewpoint, bbox
 
 
 def xywh2xyxy(bbox):

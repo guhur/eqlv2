@@ -7,7 +7,7 @@ from mmdet.datasets.pipelines import Compose
 import torch
 
 
-def inference_detector(model, img):
+def inference_detector(model, img, bbox=None):
     """Inference image(s) with the detector.
 
     Args:
@@ -48,8 +48,15 @@ def inference_detector(model, img):
         img = data['img'][0]
         img_metas = data['img_metas'][0]
         x = model.extract_feat(img)
-        proposal_list = model.rpn_head.simple_test_rpn(x, img_metas)
-        rois = bbox2roi(proposal_list)
+        
+        if bbox is None:
+            proposal_list = model.rpn_head.simple_test_rpn(x, img_metas)
+            rois = bbox2roi(proposal_list)
+            cfg = model.roi_head.test_cfg
+        else:
+            rois = bbox2roi(bbox)
+            cfg = None
+
         # cls_score: N, 1204 --> classification score for each bbox
         # bbox_pred: N, 4812 = (1204 - 1) * 4 --> bbox for each cat
         # bbox_feats: N, 256, 7, 7
@@ -63,8 +70,18 @@ def inference_detector(model, img):
             img_shape,
             scale_factor,
             rescale=True,
-            cfg=model.roi_head.test_cfg)
+            cfg=cfg)
 
+    if bbox is not None:
+        labels = det_labels.argmax(1).cpu()
+        cls_score = bbox_results['cls_score'][:0, :-1].cpu()
+        assert (labels == cls_score).all()
+        return {
+            'bbox': bboxes.cpu(),
+            'labels': labels,
+            'cls_score': cls_score,
+            'features': bbox_results['bbox_feats'][:0, :-1].cpu(),
+        }
     if det_labels.numel() == 0:
         return {
             'bbox': det_bboxes.cpu(),
